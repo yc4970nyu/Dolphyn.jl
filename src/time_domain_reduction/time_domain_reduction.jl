@@ -268,6 +268,89 @@ https://juliastats.org/Clustering.jl/dev/kmeans.html
 K-Medoids:
  https://juliastats.org/Clustering.jl/stable/kmedoids.html
 """
+using Flux
+using Flux: Chain, Dense, leakyrelu, Conv, reshape, mse
+using Clustering
+using Statistics
+using Random
+using LinearAlgebra
+using Distances
+
+# Temporal Autoencoder Architecture
+function TemporalAutoencoder_Simplified_NoConvTranspose(input_dim, timesteps, n_filters=30, kernel_size=5, strides=3, latent_dim=50)
+    # Encoder
+    encoder = Chain(
+        Conv((kernel_size, 1), input_dim=>n_filters, stride=strides, pad=(div(kernel_size, 2), 0)),
+        leakyrelu,
+        x -> reshape(x, :, timesteps ÷ strides * n_filters),
+        Dense(timesteps ÷ strides * n_filters, latent_dim)
+    )
+    
+    # Decoder
+    decoder = Chain(
+        Dense(latent_dim, timesteps * input_dim),
+        x -> reshape(x, (input_dim, timesteps)) |> relu
+    )
+    
+    autoencoder = Chain(encoder, decoder)
+    return autoencoder, encoder, decoder
+end
+
+# Combined Loss Function for Simultaneous Autoencoder
+function combined_loss(y_true, y_pred, encoded_data, labels, centroids, λ=0.1)
+    reconstruction_loss = mean(mse.(y_true, y_pred))
+    clustering_loss = mean(sum((encoded_data .- centroids[labels, :]) .^ 2, dims=2))
+    return (1 - λ) * reconstruction_loss + λ * clustering_loss
+end
+
+# KMeans Clustering Layer
+function kmeans_clustering(encoded_data, n_clusters)
+    result = kmeans(encoded_data, n_clusters)
+    return result.centers, result.assignments
+end
+
+# Simultaneous Autoencoder Model Definition
+mutable struct SimultaneousAutoencoder
+    autoencoder::Chain
+    encoder::Chain
+    clustering_layer::Function
+    n_clusters::Int
+    λ::Float64
+    centroids::Array{Float64}
+end
+
+function SimultaneousAutoencoder(input_dim, timesteps, n_clusters, λ=0.1)
+    autoencoder, encoder, decoder = TemporalAutoencoder_Simplified_NoConvTranspose(input_dim, timesteps)
+    clustering_layer = (x) -> kmeans_clustering(x, n_clusters)
+    return SimultaneousAutoencoder(autoencoder, encoder, clustering_layer, n_clusters, λ, zeros(n_clusters, 50))
+end
+
+# Custom Training Loop for Simultaneous Autoencoder
+function train_simultaneous_autoencoder(data, n_clusters, λ, epochs=10, batch_size=100)
+    model = SimultaneousAutoencoder(1, 1008, n_clusters, λ)
+    opt = ADAM()
+    train_loss = []
+    
+    for epoch in 1:epochs
+        epoch_loss = 0.0
+        for i in 1:batch_size:size(data, 1)
+            batch_data = data[i:min(i+batch_size-1, end), :, :]
+            encoded_data = model.encoder(batch_data)
+            centroids, labels = model.clustering_layer(encoded_data)
+            model.centroids = centroids
+            y_pred = model.autoencoder(batch_data)
+            loss = combined_loss(batch_data, y_pred, encoded_data, labels, centroids, λ)
+            Flux.back!(loss)
+            opt()
+            epoch_loss += loss
+        end
+        push!(train_loss, epoch_loss / (size(data, 1) / batch_size))
+        println("Epoch $epoch, Loss: $(train_loss[end])")
+    end
+    return model, train_loss
+end
+
+# Cluster Function Incorporating KMeans, Sequential, and Simultaneous Approaches
 function cluster(ClusterMethod, ClusteringInputDF, NClusters, nIters, v=false)
     if ClusterMethod == "kmeans"
         DistMatrix = pairwise(Euclidean(), Matrix(ClusteringInputDF), dims=2)
@@ -290,8 +373,8 @@ function cluster(ClusterMethod, ClusteringInputDF, NClusters, nIters, v=false)
 
         M = []
         for i in 1:NClusters
-            dists = [euclidean(Centers[:,i], ClusteringInputDF[!, j]) for j in 1:size(ClusteringInputDF, 2)]
-            push!(M,argmin(dists))
+            dists = [euclidean(Centers[:,i], ClusteringInputDF[j,:]) for j in 1:size(ClusteringInputDF, 1)]
+            push!(M, argmin(dists))
         end
 
     elseif ClusterMethod == "kmedoids"
@@ -311,10 +394,44 @@ function cluster(ClusterMethod, ClusteringInputDF, NClusters, nIters, v=false)
         A = R.assignments # get points to clusters mapping - A for Assignments
         W = R.counts # get the cluster sizes - W for Weights
         M = R.medoids # get the cluster centers - M for Medoids
+
+    elseif ClusterMethod == "sequential"
+        autoencoder, encoder, _ = TemporalAutoencoder_Simplified_NoConvTranspose(1, size(ClusteringInputDF, 2))
+        opt = ADAM()
+        Flux.train!(mse, opt, autoencoder, ClusteringInputDF, ClusteringInputDF)
+        encoded_data = encoder(ClusteringInputDF)
+        result = kmeans(encoded_data, NClusters)
+        A = result.assignments
+        W = result.counts
+        Centers = result.centers
+
+        M = []
+        for i in 1:NClusters
+            dists = [euclidean(Centers[i,:], encoded_data[j,:]) for j in 1:size(encoded_data, 1)]
+            push!(M, argmin(dists))
+        end
+
+    elseif ClusterMethod == "simultaneous"
+        data = reshape(ClusteringInputDF, :, 1, size(ClusteringInputDF, 2))  # Assuming 3D shape required for Conv1D
+        model, _ = train_simultaneous_autoencoder(data, NClusters, 0.1, epochs=20, batch_size=100)
+        encoded_data = model.encoder(ClusteringInputDF)
+        centroids, A = model.clustering_layer(encoded_data)
+        W = map(x -> sum(A .== x), 1:NClusters)  # Count points per cluster
+
+        M = []
+        for i in 1:NClusters
+            cluster_data = ClusteringInputDF[A .== i, :]
+            if !isempty(cluster_data)
+                dists = [euclidean(cluster_data[j,:], centroids[i,:]) for j in 1:size(cluster_data, 1)]
+                push!(M, argmin(dists))
+            end
+        end
+        DistMatrix = pairwise(Euclidean(), Matrix(ClusteringInputDF), dims=2)
+
     else
-        println(" -- INVALID ClusterMethod. Select kmeans or kmedoids. Running kmeans instead.")
-        return cluster("kmeans", ClusteringInputDF, NClusters, nIters)
+        error("Unsupported ClusterMethod. Choose 'kmeans', 'kmedoids', 'sequential', or 'simultaneous'.")
     end
+
     return [R, A, W, M, DistMatrix]
 end
 
